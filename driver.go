@@ -10,6 +10,9 @@ package adplugadl
 // Westwood AdLib driver.
 const callbacksPerSecond = 72
 
+// CallbacksPerSecond is the exported ADL driver tick rate.
+const CallbacksPerSecond = callbacksPerSecond
+
 // channel represents the state of a single ADL channel (0-8 = OPL melodic,
 // 9 = control channel).
 type channel struct {
