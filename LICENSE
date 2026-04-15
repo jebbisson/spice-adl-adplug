@@ -1,0 +1,8 @@
+GNU LESSER GENERAL PUBLIC LICENSE
+Version 2.1, February 1999
+
+This repository is distributed under the GNU Lesser General Public License
+version 2.1 or, at your option, any later version.
+
+This repository contains a Go port/repackaging of ADL playback logic derived
+from AdPlug along with repository-specific wrapper code.
