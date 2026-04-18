@@ -14,6 +14,7 @@ type Runtime interface {
 	IsChannelRepeating(ch int) bool
 	SnapshotChannels() []ChannelState
 	SetTraceFunc(fn func(format string, args ...interface{}))
+	SetEventFunc(fn ChannelEventFunc)
 }
 
 // RuntimeFactory constructs a runtime bound to a backend.

@@ -262,6 +262,14 @@ func (p *Player) SetTraceFunc(fn func(format string, args ...interface{})) {
 	p.runtime.SetTraceFunc(fn)
 }
 
+// SetEventFunc sets a structured runtime event callback for converter/debugging
+// use. The callback is invoked synchronously during callback execution.
+func (p *Player) SetEventFunc(fn ChannelEventFunc) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.runtime.SetEventFunc(fn)
+}
+
 // ChannelStates returns a coherent snapshot of the current driver channels.
 func (p *Player) ChannelStates() []ChannelState {
 	p.mu.Lock()

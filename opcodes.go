@@ -378,6 +378,7 @@ func (d *Driver) opcodeSetupInstrument(ch *channel, p int) int {
 	ch.currentInstrumentID = instID
 	d.trace("setupInstrument: ch%d inst=%d (offset=%d)", d.curChannel, instID, instOffset)
 	d.setupInstrument(d.curRegOffset, instOffset, ch)
+	d.emitEvent(EventInstrumentChange, d.curChannel)
 	return 0
 }
 

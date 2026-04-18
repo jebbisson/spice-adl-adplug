@@ -21,6 +21,7 @@ type channel struct {
 
 	currentInstrumentID int
 	currentNoteDuration uint8
+	feedback            uint8
 
 	opExtraLevel2 uint8
 
@@ -84,6 +85,35 @@ type channel struct {
 	volumeModifier uint8
 }
 
+// ChannelEventType identifies a structured semantic playback event emitted by
+// the ADL driver while it executes bytecode.
+type ChannelEventType int
+
+const (
+	// EventInstrumentChange fires when a channel loads a new base instrument.
+	EventInstrumentChange ChannelEventType = iota
+	// EventNoteOn fires when a channel asserts key-on for a note.
+	EventNoteOn
+	// EventNoteOff fires when a channel clears key-on for a note.
+	EventNoteOff
+	// EventVolumeChange fires when a channel's effective operator levels are
+	// recomputed and written to the OPL registers.
+	EventVolumeChange
+)
+
+// ChannelEvent is a structured semantic event emitted during playback.
+// Tick is the 72 Hz callback count, starting at 0 for the first callback after
+// InitDriver.
+type ChannelEvent struct {
+	Tick    uint64
+	Type    ChannelEventType
+	Channel int
+	State   ChannelState
+}
+
+// ChannelEventFunc receives structured driver events.
+type ChannelEventFunc func(ChannelEvent)
+
 // queueEntry represents a program waiting to be started.
 type queueEntry struct {
 	dataOffset int // Offset into soundData, -1 = empty.
@@ -121,6 +151,7 @@ type Driver struct {
 
 	// Trace callback for debugging. If non-nil, called for key events.
 	TraceFunc func(format string, args ...interface{})
+	EventFunc ChannelEventFunc
 
 	// Rhythm section volume levels.
 	opLevelBD, opLevelHH, opLevelSD, opLevelTT, opLevelCY uint8
@@ -147,6 +178,8 @@ type Driver struct {
 	sfxPointer  int // Offset into soundData for restoring SFX data; -1 = none.
 	sfxPriority uint8
 	sfxVelocity uint8
+
+	callbackCount uint64
 }
 
 // ChannelState is a read-only snapshot of one ADL driver channel.
@@ -161,6 +194,8 @@ type ChannelState struct {
 	RawNote            uint8
 	Note               string
 	FrequencyHz        float64
+	RegAx              uint8
+	RegBx              uint8
 	Duration           uint8
 	InitialDuration    uint8
 	Spacing1           uint8
@@ -169,6 +204,13 @@ type ChannelState struct {
 	OutputLevel        float64
 	CarrierLevel       uint8
 	ModulatorLevel     uint8
+	BaseCarrierLevel   uint8
+	BaseModulatorLevel uint8
+	ExtraLevel1        uint8
+	ExtraLevel2        uint8
+	ExtraLevel3        uint8
+	Feedback           uint8
+	Connection         uint8
 	TwoOperatorCarrier bool
 	Dataptr            int
 }
@@ -198,6 +240,12 @@ func NewDriver(opl Backend) *Driver {
 // SetTraceFunc sets the optional trace callback used for debugging.
 func (d *Driver) SetTraceFunc(fn func(format string, args ...interface{})) {
 	d.TraceFunc = fn
+}
+
+// SetEventFunc sets the optional structured event callback used by higher-level
+// converters to observe note/instrument activity without parsing trace strings.
+func (d *Driver) SetEventFunc(fn ChannelEventFunc) {
+	d.EventFunc = fn
 }
 
 func (d *Driver) trace(format string, args ...interface{}) {
@@ -285,6 +333,7 @@ func (d *Driver) StopAllChannels() {
 
 // InitDriver resets the OPL state to a clean initial condition.
 func (d *Driver) InitDriver() {
+	d.callbackCount = 0
 	d.resetAdLibState()
 }
 
@@ -298,13 +347,15 @@ func (d *Driver) Callback() {
 	}
 	d.executePrograms()
 
-	if advance(&d.callbackTimer, d.tempo) {
-		d.beatDivCnt--
-		if d.beatDivCnt == 0 {
-			d.beatDivCnt = d.beatDivider
-			d.beatCounter++
+		if advance(&d.callbackTimer, d.tempo) {
+			d.beatDivCnt--
+			if d.beatDivCnt == 0 {
+				d.beatDivCnt = d.beatDivider
+				d.beatCounter++
+			}
 		}
-	}
+
+	d.callbackCount++
 }
 
 // --- Internal methods ---
@@ -327,6 +378,9 @@ func (d *Driver) getInstrument(instID int) int {
 func (d *Driver) writeOPL(reg, val uint8) {
 	// ADL playback depends on buffered OPL writes for correct timing on dense,
 	// repeated-note passages. See fixes/2026-04-13-adl-buffered-opl-writes.md.
+	if d.opl == nil {
+		return
+	}
 	d.opl.WriteRegisterBuffered(0, reg, val)
 }
 
@@ -370,6 +424,7 @@ func (d *Driver) noteOff(ch *channel) {
 	}
 	ch.regBx &= 0xDF
 	d.writeOPL(0xB0+uint8(d.curChannel), ch.regBx)
+	d.emitEvent(EventNoteOff, d.curChannel)
 }
 
 func (d *Driver) initAdlibChannel(num int) {
@@ -413,35 +468,64 @@ func (d *Driver) setupDuration(duration uint8, ch *channel) {
 func (d *Driver) SnapshotChannels() []ChannelState {
 	states := make([]ChannelState, len(d.channels))
 	for i := range d.channels {
-		ch := &d.channels[i]
-		keyOn := ch.regBx&0x20 != 0
-		carrier := d.calculateOpLevel2(ch) & 0x3F
-		modulator := d.calculateOpLevel1(ch) & 0x3F
-
-		states[i] = ChannelState{
-			Channel:            i,
-			BytecodeActive:     ch.dataptr >= 0,
-			KeyOn:              keyOn,
-			Repeating:          ch.repeating,
-			Releasing:          ch.dataptr >= 0 && !keyOn && ch.duration > 0,
-			ControlChannel:     i == 9,
-			InstrumentID:       ch.currentInstrumentID,
-			RawNote:            ch.rawNote,
-			Note:               channelNoteName(ch),
-			FrequencyHz:        regToFreq(ch.regAx, ch.regBx),
-			Duration:           ch.duration,
-			InitialDuration:    ch.currentNoteDuration,
-			Spacing1:           ch.spacing1,
-			Spacing2:           ch.spacing2,
-			VolumeModifier:     ch.volumeModifier,
-			OutputLevel:        d.opl.ChannelMeter(i),
-			CarrierLevel:       carrier,
-			ModulatorLevel:     modulator,
-			TwoOperatorCarrier: ch.twoChan != 0,
-			Dataptr:            ch.dataptr,
-		}
+		states[i] = d.snapshotChannel(i)
 	}
 	return states
+}
+
+func (d *Driver) snapshotChannel(i int) ChannelState {
+	ch := &d.channels[i]
+	keyOn := ch.regBx&0x20 != 0
+	carrier := d.calculateOpLevel2(ch) & 0x3F
+	modulator := d.calculateOpLevel1(ch) & 0x3F
+	outputLevel := 0.0
+	if d.opl != nil {
+		outputLevel = d.opl.ChannelMeter(i)
+	}
+
+	return ChannelState{
+		Channel:            i,
+		BytecodeActive:     ch.dataptr >= 0,
+		KeyOn:              keyOn,
+		Repeating:          ch.repeating,
+		Releasing:          ch.dataptr >= 0 && !keyOn && ch.duration > 0,
+		ControlChannel:     i == 9,
+		InstrumentID:       ch.currentInstrumentID,
+		RawNote:            ch.rawNote,
+		Note:               channelNoteName(ch),
+		FrequencyHz:        regToFreq(ch.regAx, ch.regBx),
+		RegAx:              ch.regAx,
+		RegBx:              ch.regBx,
+		Duration:           ch.duration,
+		InitialDuration:    ch.currentNoteDuration,
+		Spacing1:           ch.spacing1,
+		Spacing2:           ch.spacing2,
+		VolumeModifier:     ch.volumeModifier,
+		OutputLevel:        outputLevel,
+		CarrierLevel:       carrier,
+		ModulatorLevel:     modulator,
+		BaseCarrierLevel:   ch.opLevel2 & 0x3F,
+		BaseModulatorLevel: ch.opLevel1 & 0x3F,
+		ExtraLevel1:        ch.opExtraLevel1,
+		ExtraLevel2:        ch.opExtraLevel2,
+		ExtraLevel3:        ch.opExtraLevel3,
+		Feedback:           ch.feedback,
+		Connection:         ch.twoChan & 0x01,
+		TwoOperatorCarrier: ch.twoChan != 0,
+		Dataptr:            ch.dataptr,
+	}
+}
+
+func (d *Driver) emitEvent(kind ChannelEventType, channel int) {
+	if d.EventFunc == nil || channel < 0 || channel >= len(d.channels) {
+		return
+	}
+	d.EventFunc(ChannelEvent{
+		Tick:    d.callbackCount,
+		Type:    kind,
+		Channel: channel,
+		State:   d.snapshotChannel(channel),
+	})
 }
 
 func channelNoteName(ch *channel) string {
@@ -523,6 +607,7 @@ func (d *Driver) setupInstrument(regOff uint8, dataOff int, ch *channel) {
 	temp := data[2]
 	d.writeOPL(0xC0+uint8(d.curChannel), temp)
 	ch.twoChan = temp & 1
+	ch.feedback = (temp >> 1) & 0x07
 
 	d.writeOPL(0xE0+regOff, data[3])
 	d.writeOPL(0xE3+regOff, data[4])
@@ -562,6 +647,7 @@ func (d *Driver) noteOn(ch *channel) {
 	}
 	ch.regBx |= 0x20
 	d.writeOPL(0xB0+uint8(d.curChannel), ch.regBx)
+	d.emitEvent(EventNoteOn, d.curChannel)
 
 	// Update vibrato step based on current frequency.
 	shift := int8(9) - clampI8(int8(ch.vibratoStepRange), 0, 9)
@@ -585,6 +671,7 @@ func (d *Driver) adjustVolume(ch *channel) {
 		d.trace("adjustVolume: ch%d twoChan=0 extraLevel1=0x%02X extraLevel2=0x%02X extraLevel3=0x%02X volMod=0x%02X → reg43=0x%02X",
 			d.curChannel, ch.opExtraLevel1, ch.opExtraLevel2, ch.opExtraLevel3, ch.volumeModifier, ol2)
 	}
+	d.emitEvent(EventVolumeChange, d.curChannel)
 }
 
 func (d *Driver) calculateOpLevel1(ch *channel) uint8 {
